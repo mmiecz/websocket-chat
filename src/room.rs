@@ -3,9 +3,8 @@ use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 use tracing::info;
 
 use thiserror::Error;
@@ -55,18 +54,35 @@ async fn handle_user(
         .expect("failed to accept stream");
 
     let (mut tx, rx) = unbounded();
-    peer_map.lock().await.insert(addr, tx);
+    peer_map
+        .lock()
+        .expect("failed to obtain peer map mutex!")
+        .insert(addr, tx);
 
     let (mut outgoing, mut incoming) = ws_stream.split();
     let message_incoming = incoming.try_for_each(|msg| {
         match msg {
-            Message::Text(txt) => {
+            Message::Text(ref txt) => {
                 info!(%addr, msg = ?txt, "message ");
+                // fanout message to others in the room.
+                // We could filter original sender, but whatever. Pretend sending message back is a confirmation.
+                for peer in peer_map.lock().unwrap().iter_mut() {
+                    // This lock should be probably
+                    info!(%addr, "peer map mutext lock obtained");
+                    let peer_addr = peer.0;
+                    let tx = peer.1;
+                    info!(%addr, recipient = %peer_addr, "room fanout");
+                    let msg = msg.clone();
+                    tx.unbounded_send(msg).unwrap();
+                }
             }
             Message::Binary(_) => {}
             Message::Ping(_) => {}
             Message::Pong(_) => {}
-            Message::Close(_) => {}
+            Message::Close(_) => {
+                info!(%addr, "user leaving the room, removing from peer map");
+                peer_map.lock().unwrap().remove(&addr);
+            }
             Message::Frame(_) => {}
         }
         future::ok(())
